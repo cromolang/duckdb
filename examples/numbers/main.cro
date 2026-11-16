@@ -1,0 +1,13 @@
+import duckdb
+
+i32 main() {
+    duckdb.Database data = duckdb.Database("")
+    duckdb.Connection c = data.connect()
+    c.exec("CREATE TABLE numbers AS SELECT range AS n FROM range(1000000)")
+    duckdb.Statement sum = c.prepare("SELECT count(*), avg(n) FROM numbers WHERE n % ? = 0")
+    sum.setInt(1, 2)
+    for (sum.next()) {
+        println("{} rows, average {}", sum.getInt(0), sum.getFloat(1))
+    }
+    ret 0
+}

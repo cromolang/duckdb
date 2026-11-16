@@ -1,0 +1,102 @@
+// The tests of the package: cromo test duckdb.cro, in this folder.
+
+bool near(f64 a, f64 b) {
+    f64 d = a - b
+    ret d < 0.0001 && d > -0.0001
+}
+
+[[test]]
+void theVersion() {
+    assert(version().startsWith("v"))
+}
+
+[[test]]
+void aTable() {
+    Database data = Database("")
+    Connection c = data.connect()
+    assert(c.exec("CREATE TABLE notes (id INTEGER, title VARCHAR, done BOOLEAN, weight DOUBLE)") == 0)
+    Statement insert = c.prepare("INSERT INTO notes VALUES (?, ?, ?, ?)")
+    insert.setInt(1, 1)
+    insert.setText(2, "Buy the bread")
+    insert.setBool(3, true)
+    insert.setFloat(4, 0.5)
+    assert(insert.exec() == 1)
+    insert.setInt(1, 2)
+    insert.setText(2, "Città, perché, 日本")
+    insert.setBool(3, false)
+    insert.setNull(4)
+    assert(insert.exec() == 1)
+
+    Statement all = c.prepare("SELECT id, title, done, weight FROM notes ORDER BY id")
+    assert(all.next())
+    assert(all.columnCount() == 4 && all.columnName(1) == "title")
+    assert(all.getInt(0) == 1 && all.getText(1) == "Buy the bread" && all.getBool(2) && near(all.getFloat(3), 0.5))
+    assert(all.next())
+    assert(all.getInt(0) == 2 && all.getText(1) == "Città, perché, 日本" && !all.getBool(2) && all.isNull(3))
+    assert(!all.next())
+    assert(all.next())  // from its first row again
+    assert(all.getInt(0) == 1)
+}
+
+[[test]]
+void aMillionRows() {
+    Database data = Database("")
+    Connection c = data.connect()
+    c.exec("CREATE TABLE numbers AS SELECT range AS n FROM range(1000000)")
+    Statement sum = c.prepare("SELECT count(*), sum(n), avg(n), max(n) FROM numbers WHERE n % ? = 0")
+    sum.setInt(1, 2)
+    assert(sum.next())
+    assert(sum.getInt(0) == 500000)
+    assert(sum.getInt(1) == 249999500000)  // a sum is of 128 bits for DuckDB: converted
+    assert(near(sum.getFloat(2), 499999.0))
+    assert(sum.getInt(3) == 999998)
+    assert(sum.getText(1) == "249999500000")
+}
+
+[[test]]
+void aTransaction() {
+    Database data = Database("")
+    Connection c = data.connect()
+    c.exec("CREATE TABLE t (n INTEGER)")
+    c.begin()
+    c.exec("INSERT INTO t VALUES (1), (2), (3)")
+    c.rollback()
+    Statement count = c.prepare("SELECT count(*) FROM t")
+    assert(count.next() && count.getInt(0) == 0)
+    c.begin()
+    assert(c.exec("INSERT INTO t VALUES (1), (2), (3)") == 3)
+    c.commit()
+    count.reset()
+    assert(count.next() && count.getInt(0) == 3)
+}
+
+[[test]]
+void theErrors() {
+    Database data = Database("")
+    Connection c = data.connect()
+    bool refused = false
+    try {
+        c.exec("SELEKT 1")
+    } catch (Error e) {
+        refused = e.message().contains("syntax error")
+    }
+    assert(refused)
+    refused = false
+    try {
+        Statement s = c.prepare("SELECT * FROM nothing")
+    } catch (Error e) {
+        refused = e.message().contains("nothing")
+    }
+    assert(refused)
+}
+
+[[test]]
+void twoConnections() {
+    Database data = Database("")
+    Connection first = data.connect()
+    Connection second = data.connect()
+    first.exec("CREATE TABLE shared (n INTEGER)")
+    first.exec("INSERT INTO shared VALUES (7)")
+    Statement read = second.prepare("SELECT n FROM shared")
+    assert(read.next() && read.getInt(0) == 7)
+}

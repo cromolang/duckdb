@@ -1,0 +1,367 @@
+// DuckDB for Cromo: a database for analysis inside the program, in a file or in
+// memory, which reads tables of millions of rows, and files in the CSV and Parquet
+// formats, with SQL. The library of DuckDB comes with the package, for Windows and
+// for Linux on x86-64: cromo downloads it by the lines native of cromo.mod, and puts
+// it next to the executable.
+//
+// '''
+// import duckdb
+//
+// duckdb.Database data = duckdb.Database("")   // in memory; a path for a file
+// duckdb.Connection c = data.connect()
+// c.exec("CREATE TABLE sales AS SELECT * FROM read_csv('sales.csv')")
+// duckdb.Statement byCity = c.prepare("SELECT city, sum(total) FROM sales WHERE year = ? GROUP BY city")
+// byCity.setInt(1, 2026)
+// for (byCity.next()) {
+//     println("{} {}", byCity.getText(0), byCity.getFloat(1))
+// }
+// '''
+//
+// The names are those of std.db: a 'Database', its 'Connection's, and a 'Statement'
+// with parameters from 1 and columns from 0. An error of DuckDB, as a statement that
+// is not SQL, is an 'Error' with its message; a wrong use of the module, as a column
+// that the row does not have, is a panic.
+
+// The C API of DuckDB (duckdb.h). The handles are addresses, written by DuckDB into a
+// place that the module gives; a result is a struct of 48 bytes that DuckDB fills,
+// and its values are read with the functions duckdb_value_*, which convert each type
+// of DuckDB to the one asked.
+import unsafe
+
+extern "duckdb" {
+    addr duckdb_library_version()
+    i32 duckdb_open(addr path, addr database)  // 0 is success, as for the others that give an i32
+    void duckdb_close(addr database)
+    i32 duckdb_connect(addr database, addr connection)
+    void duckdb_disconnect(addr connection)
+    i32 duckdb_query(addr connection, addr sql, addr result)
+    void duckdb_destroy_result(addr result)
+    addr duckdb_result_error(addr result)
+    i64 duckdb_rows_changed(addr result)
+    i64 duckdb_row_count(addr result)
+    i64 duckdb_column_count(addr result)
+    addr duckdb_column_name(addr result, i64 column)
+    i32 duckdb_prepare(addr connection, addr sql, addr statement)
+    addr duckdb_prepare_error(addr statement)
+    void duckdb_destroy_prepare(addr statement)
+    i64 duckdb_nparams(addr statement)
+    i32 duckdb_clear_bindings(addr statement)
+    i32 duckdb_bind_int64(addr statement, i64 index, i64 value)
+    i32 duckdb_bind_double(addr statement, i64 index, f64 value)
+    i32 duckdb_bind_boolean(addr statement, i64 index, bool value)
+    i32 duckdb_bind_varchar_length(addr statement, i64 index, addr text, i64 length)
+    i32 duckdb_bind_null(addr statement, i64 index)
+    i32 duckdb_execute_prepared(addr statement, addr result)
+    bool duckdb_value_is_null(addr result, i64 column, i64 row)
+    i64 duckdb_value_int64(addr result, i64 column, i64 row)
+    f64 duckdb_value_double(addr result, i64 column, i64 row)
+    bool duckdb_value_boolean(addr result, i64 column, i64 row)
+    addr duckdb_value_varchar(addr result, i64 column, i64 row)
+    void duckdb_free(addr memory)
+}
+
+const i64 resultSize = 48  // of the struct duckdb_result
+
+// A string of C, ended by a zero.
+string cText(addr text) {
+    addr none
+    if (text == none) {
+        ret ""
+    }
+    i64 n = 0
+    for (take<u8>(offset(text, n)) != 0) {
+        n++
+    }
+    ret string(text, n)
+}
+
+// A place for an address that DuckDB writes, with nothing in it.
+addr place() {
+    addr slot = alloc(8)
+    addr none
+    put<addr>(slot, none)
+    ret slot
+}
+
+// The version of the library of DuckDB in use, as "v1.5.6".
+public string version() {
+    ret cText(duckdb_library_version())
+}
+
+// A database of DuckDB: a file, made if it is missing, or one in memory. It is not
+// copied, only moved, and is closed when it ends; its connections end before it.
+public struct Database {
+    addr handle
+
+    // Opens the database of a file, or one in memory with "" or ":memory:". Throws an
+    // 'Error' when the file cannot be opened, as one that is not a database of DuckDB.
+    public Database(string path) {
+        string where = path.len() == 0 ? ":memory:" : path.copy()  // kept until the call ends
+        addr slot = place()
+        i32 state = duckdb_open(where.cstring(), slot)
+        handle = take<addr>(slot)
+        free(slot)
+        if (state != 0) {
+            throw Error(format("cannot open the database {}", where))
+        }
+    }
+
+    ~Database() {
+        addr none
+        if (handle != none) {
+            addr slot = place()
+            put<addr>(slot, handle)
+            duckdb_close(slot)
+            free(slot)
+        }
+    }
+
+    // A connection to the database, for one thread at a time: each thread that works
+    // on the database has its own.
+    public Connection connect() const {
+        addr slot = place()
+        i32 state = duckdb_connect(handle, slot)
+        Connection made
+        made.handle = take<addr>(slot)
+        free(slot)
+        if (state != 0) {
+            throw Error("cannot connect to the database")
+        }
+        ret made
+    }
+}
+
+// A connection to a database, which runs statements. It is not copied, only moved.
+public struct Connection {
+    addr handle
+
+    ~Connection() {
+        addr none
+        if (handle != none) {
+            addr slot = place()
+            put<addr>(slot, handle)
+            duckdb_disconnect(slot)
+            free(slot)
+        }
+    }
+
+    // Runs a statement without parameters and gives the rows that it changed: 0 for
+    // one that changes none, as CREATE TABLE. Throws an 'Error' with what DuckDB says.
+    public i64 exec(string sql) {
+        addr result = alloc(resultSize)
+        i64 changed = 0
+        try {
+            if (duckdb_query(handle, sql.cstring(), result) != 0) {
+                throw Error(cText(duckdb_result_error(result)))
+            }
+            changed = duckdb_rows_changed(result)
+        } finally {
+            duckdb_destroy_result(result)
+            free(result)
+        }
+        ret changed
+    }
+
+    // Starts a transaction: what follows is of the database only with 'commit'.
+    public void begin() {
+        exec("BEGIN TRANSACTION")
+    }
+
+    // Ends the transaction, and keeps what it did.
+    public void commit() {
+        exec("COMMIT")
+    }
+
+    // Ends the transaction, and leaves the database as it was before it.
+    public void rollback() {
+        exec("ROLLBACK")
+    }
+
+    // A statement with its parameters, written '?' or '$1', to run more than once.
+    // Throws an 'Error' with what DuckDB says when it is not SQL that it can run.
+    public Statement prepare(string sql) {
+        addr slot = place()
+        i32 state = duckdb_prepare(handle, sql.cstring(), slot)
+        Statement made
+        made.handle = take<addr>(slot)
+        free(slot)
+        if (state != 0) {
+            throw Error(cText(duckdb_prepare_error(made.handle)))  // the statement is destroyed as it ends
+        }
+        ret made
+    }
+}
+
+// A statement with parameters, from 1, which gives rows whose columns are from 0. It
+// is not copied, only moved. It must end before its connection.
+public struct Statement {
+    addr handle
+    addr result   // of the last run, or nothing
+    i64 rows      // that it has
+    i64 row = -1  // the one that 'next' gave
+
+    ~Statement() {
+        clear()
+        addr none
+        if (handle != none) {
+            addr slot = place()
+            put<addr>(slot, handle)
+            duckdb_destroy_prepare(slot)
+            free(slot)
+        }
+    }
+
+    void clear() {
+        addr none
+        if (result != none) {
+            duckdb_destroy_result(result)
+            free(result)
+            result = none
+        }
+        rows = 0
+        row = -1
+    }
+
+    void parameter(i64 index) const {
+        i64 count = duckdb_nparams(handle)
+        if (index < 1 || index > count) {
+            panic(format("the statement has {} parameters, from 1: there is no parameter {}", count, index))
+        }
+    }
+
+    void bound(i32 state, i64 index) const {
+        if (state != 0) {
+            throw Error(format("cannot give the parameter {} to the statement", index))
+        }
+    }
+
+    // Gives a parameter an integer. A parameter that the statement does not have is a panic.
+    public void setInt(i64 index, i64 value) {
+        parameter(index)
+        bound(duckdb_bind_int64(handle, index, value), index)
+    }
+
+    // Gives a parameter a number with a fraction.
+    public void setFloat(i64 index, f64 value) {
+        parameter(index)
+        bound(duckdb_bind_double(handle, index, value), index)
+    }
+
+    // Gives a parameter a text.
+    public void setText(i64 index, string value) {
+        parameter(index)
+        bound(duckdb_bind_varchar_length(handle, index, value.cstring(), value.len()), index)
+    }
+
+    // Gives a parameter true or false.
+    public void setBool(i64 index, bool value) {
+        parameter(index)
+        bound(duckdb_bind_boolean(handle, index, value), index)
+    }
+
+    // Gives a parameter no value, NULL.
+    public void setNull(i64 index) {
+        parameter(index)
+        bound(duckdb_bind_null(handle, index), index)
+    }
+
+    void execute() {
+        clear()
+        result = alloc(resultSize)
+        if (duckdb_execute_prepared(handle, result) != 0) {
+            string message = cText(duckdb_result_error(result))
+            clear()
+            throw Error(message)
+        }
+        rows = duckdb_row_count(result)
+    }
+
+    // Runs the statement with its parameters and gives the rows that it changed, for
+    // one that gives no rows, as INSERT. Throws an 'Error' with what DuckDB says.
+    public i64 exec() {
+        execute()
+        i64 changed = duckdb_rows_changed(result)
+        clear()
+        ret changed
+    }
+
+    // Goes to the next row, the first time running the statement: false after the last
+    // one. After it the statement can run again, with other parameters.
+    public bool next() {
+        addr none
+        if (result == none) {
+            execute()
+        }
+        row++
+        if (row < rows) {
+            ret true
+        }
+        clear()
+        ret false
+    }
+
+    // Starts again: the next 'next' runs the statement from its first row.
+    public void reset() {
+        clear()
+    }
+
+    void column(i64 index) const {
+        addr none
+        if (result == none || row < 0) {
+            panic("the statement has no row: call next() first, and read while it is true")
+        }
+        i64 count = duckdb_column_count(result)
+        if (index < 0 || index >= count) {
+            panic(format("the row has {} columns, from 0: there is no column {}", count, index))
+        }
+    }
+
+    // The number of columns of the rows; 0 before the first 'next'.
+    public i64 columnCount() const {
+        addr none
+        ret result == none ? 0 : duckdb_column_count(result)
+    }
+
+    // The name of a column of the row.
+    public string columnName(i64 index) const {
+        column(index)
+        ret cText(duckdb_column_name(result, index))
+    }
+
+    // Whether a column of the row has no value, NULL.
+    public bool isNull(i64 index) const {
+        column(index)
+        ret duckdb_value_is_null(result, index, row)
+    }
+
+    // A column of the row as an integer: DuckDB converts what is of another type, and
+    // gives 0 for NULL and for what is not a number.
+    public i64 getInt(i64 index) const {
+        column(index)
+        ret duckdb_value_int64(result, index, row)
+    }
+
+    // A column of the row as a number with a fraction.
+    public f64 getFloat(i64 index) const {
+        column(index)
+        ret duckdb_value_double(result, index, row)
+    }
+
+    // A column of the row as a text, as DuckDB writes its value: "" for NULL.
+    public string getText(i64 index) const {
+        column(index)
+        addr text = duckdb_value_varchar(result, index, row)
+        string made = cText(text)
+        addr none
+        if (text != none) {
+            duckdb_free(text)
+        }
+        ret made
+    }
+
+    // A column of the row as true or false.
+    public bool getBool(i64 index) const {
+        column(index)
+        ret duckdb_value_boolean(result, index, row)
+    }
+}
